@@ -68,6 +68,50 @@ def safe_get(
 		attempt_index += 1
 
 
+def safe_post(
+	session: requests.Session,
+	url: str,
+	data: Optional[Dict[str, str]] = None,
+	max_retries: int = 5,
+	backoff_factor: float = 0.8,
+	per_request_timeout_seconds: float = 30.0,
+) -> requests.Response:
+	"""
+	HTTP POST with retries and exponential backoff with jitter.
+	Retries on network errors, 429, and 5xx. Raises on other 4xx immediately.
+	"""
+	attempt_index = 0
+	while True:
+		try:
+			response = session.post(
+				url,
+				data=data,
+				timeout=per_request_timeout_seconds,
+				allow_redirects=True,
+			)
+			status = response.status_code
+			if status == 429 or 500 <= status < 600:
+				raise requests.HTTPError(f"Transient HTTP error: {status}", response=response)
+			response.raise_for_status()
+			return response
+		except requests.HTTPError as http_error:
+			response = getattr(http_error, "response", None)
+			status = getattr(response, "status_code", None)
+			if status not in {429} and not (status is not None and 500 <= status < 600):
+				raise
+		except (requests.ConnectionError, requests.Timeout):
+			pass
+		except requests.RequestException:
+			raise
+
+		if attempt_index >= max_retries:
+			raise
+
+		delay_seconds = (backoff_factor * (2 ** attempt_index)) + random.uniform(0.0, 0.3)
+		time.sleep(delay_seconds)
+		attempt_index += 1
+
+
 def parse_options(html_text: str) -> List[Tuple[str, str]]:
 	soup = BeautifulSoup(html_text, "html.parser")
 	options: List[Tuple[str, str]] = []
@@ -79,12 +123,17 @@ def parse_options(html_text: str) -> List[Tuple[str, str]]:
 	return options
 
 
-def get_states(session: requests.Session, base_url: str, **request_kwargs) -> List[Tuple[str, str]]:
+def get_states(session: requests.Session, base_url: str, token: Optional[str] = None, **request_kwargs) -> List[Tuple[str, str]]:
+	if token:
+		return router_get_options(session, base_url, "casestatus/getState", {}, token, **request_kwargs)
+	# Fallback (may return full HTML shell and no options)
 	url = f"{base_url}/casestatus/getState"
 	return parse_options(safe_get(session, url, **request_kwargs).text)
 
 
-def get_districts(session: requests.Session, base_url: str, state_code: str, **request_kwargs) -> List[Tuple[str, str]]:
+def get_districts(session: requests.Session, base_url: str, state_code: str, token: Optional[str] = None, **request_kwargs) -> List[Tuple[str, str]]:
+	if token:
+		return router_get_options(session, base_url, "casestatus/getDistrict", {"state_code": state_code}, token, **request_kwargs)
 	url = f"{base_url}/casestatus/getDistrict"
 	return parse_options(safe_get(session, url, params={"state_code": state_code}, **request_kwargs).text)
 
@@ -94,17 +143,13 @@ def get_court_complexes(
 	base_url: str,
 	state_code: str,
 	district_code: str,
+	token: Optional[str] = None,
 	**request_kwargs,
 ) -> List[Tuple[str, str]]:
+	if token:
+		return router_get_options(session, base_url, "casestatus/getCourtComplex", {"state_code": state_code, "dist_code": district_code}, token, **request_kwargs)
 	url = f"{base_url}/casestatus/getCourtComplex"
-	return parse_options(
-		safe_get(
-			session,
-			url,
-			params={"state_code": state_code, "dist_code": district_code},
-			**request_kwargs,
-		).text
-	)
+	return parse_options(safe_get(session, url, params={"state_code": state_code, "dist_code": district_code}, **request_kwargs).text)
 
 
 def get_establishments(
@@ -113,21 +158,50 @@ def get_establishments(
 	state_code: str,
 	district_code: str,
 	court_complex_code: str,
+	token: Optional[str] = None,
 	**request_kwargs,
 ) -> List[Tuple[str, str]]:
+	if token:
+		payload = {"state_code": state_code, "dist_code": district_code, "court_complex_code": court_complex_code}
+		return router_get_options(session, base_url, "casestatus/getEstablishment", payload, token, **request_kwargs)
 	url = f"{base_url}/casestatus/getEstablishment"
-	return parse_options(
-		safe_get(
-			session,
-			url,
-			params={
-				"state_code": state_code,
-				"dist_code": district_code,
-				"court_complex_code": court_complex_code,
-			},
-			**request_kwargs,
-		).text
-	)
+	return parse_options(safe_get(session, url, params={"state_code": state_code, "dist_code": district_code, "court_complex_code": court_complex_code}, **request_kwargs).text)
+
+
+def router_get_options(
+	session: requests.Session,
+	base_url: str,
+	endpoint: str,
+	postdata: Dict[str, str],
+	token: str,
+	**request_kwargs,
+) -> List[Tuple[str, str]]:
+	url = f"{base_url}/?p={endpoint}"
+	form = dict(postdata)
+	form["ajax_req"] = "true"
+	form["app_token"] = token
+	response = safe_post(session, url, data=form, **request_kwargs)
+	text = response.text
+	# Try JSON first
+	options_html = None
+	try:
+		data_json = response.json()
+		options_html = data_json.get("data_list") or data_json.get("data") or None
+	except ValueError:
+		options_html = None
+	if not options_html:
+		options_html = text
+	return parse_options(options_html)
+
+
+def prime_session_and_token(session: requests.Session, base_url: str) -> Optional[str]:
+	"""Visit the casestatus page to prime cookies and extract app_token."""
+	resp = safe_get(session, f"{base_url}/casestatus")
+	soup = BeautifulSoup(resp.text, "html.parser")
+	token_input = soup.find("input", {"id": "app_token", "name": "app_token"})
+	if token_input and token_input.get("value"):
+		return token_input.get("value").strip()
+	return None
 
 
 def random_sleep(min_seconds: float, max_seconds: float) -> None:
@@ -138,20 +212,24 @@ def random_sleep(min_seconds: float, max_seconds: float) -> None:
 
 
 def load_existing_rows(csv_path: str) -> Tuple[List[Dict[str, str]], "set[Tuple[str, str, str, str]]"]:
-	if os.path.exists(csv_path):
-		df_existing = pd.read_csv(csv_path, dtype=str)
-		rows_existing = df_existing.fillna("").to_dict("records")
-		seen_existing = set(
-			(
-				row.get("State", ""),
-				row.get("District", ""),
-				row.get("Court Complex", ""),
-				row.get("Establishment", ""),
+	if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+		try:
+			df_existing = pd.read_csv(csv_path, dtype=str)
+			rows_existing = df_existing.fillna("").to_dict("records")
+			seen_existing = set(
+				(
+					row.get("State", ""),
+					row.get("District", ""),
+					row.get("Court Complex", ""),
+					row.get("Establishment", ""),
+				)
+				for row in rows_existing
 			)
-			for row in rows_existing
-		)
-		print(f"Resuming from {len(rows_existing)} previously saved rows.")
-		return rows_existing, seen_existing
+			print(f"Resuming from {len(rows_existing)} previously saved rows.")
+			return rows_existing, seen_existing
+		except Exception:
+			# Treat unreadable/empty CSV as fresh start
+			pass
 	return [], set()
 
 
@@ -188,7 +266,15 @@ def scrape(
 		"per_request_timeout_seconds": request_timeout_seconds,
 	}
 
-	states = get_states(session, base_url, **request_kwargs)
+	# Prime cookies and extract app_token
+	token = prime_session_and_token(session, base_url)
+	# Set AJAX-style headers to mimic site behavior
+	session.headers.update({
+		"Referer": f"{base_url}/casestatus",
+		"X-Requested-With": "XMLHttpRequest",
+	})
+
+	states = get_states(session, base_url, token=token, **request_kwargs)
 	print(f"Found {len(states)} states. Starting scrape...")
 
 	total_states = len(states)
@@ -199,11 +285,11 @@ def scrape(
 		print(f"\nProcessing State {state_index}/{total_states}: {state_label}")
 		random_sleep(rate_min_seconds, rate_max_seconds)
 
-		districts = get_districts(session, base_url, state_code, **request_kwargs)
+		districts = get_districts(session, base_url, state_code, token=token, **request_kwargs)
 		for district_code, district_label in districts:
 			random_sleep(rate_min_seconds, rate_max_seconds)
 
-			courts = get_court_complexes(session, base_url, state_code, district_code, **request_kwargs)
+			courts = get_court_complexes(session, base_url, state_code, district_code, token=token, **request_kwargs)
 			for court_code, court_label in courts:
 				random_sleep(rate_min_seconds, rate_max_seconds)
 
@@ -213,6 +299,7 @@ def scrape(
 					state_code,
 					district_code,
 					court_code,
+					token=token,
 					**request_kwargs,
 				)
 				for establishment_code, establishment_label in establishments:
